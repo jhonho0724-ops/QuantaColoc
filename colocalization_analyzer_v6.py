@@ -476,26 +476,55 @@ def polygon_to_mask(vertices, shape):
 #  Puncta Detection
 # ─────────────────────────────────────────────
 def detect_puncta(img2d, mask=None, method='otsu',
-                  min_size=5, max_size=500):
+                  min_size=5, max_size=500, use_watershed=True):
+    """
+    Puncta 검출 + Watershed 분리.
+    붙어있는 puncta를 개별 object로 분리함.
+    """
+    from skimage.segmentation import watershed
+    from skimage.feature import peak_local_max
+    from scipy.ndimage import distance_transform_edt
+
     img_f = img2d.astype(float)
     if mask is not None:
         img_f[~mask] = 0
     if img_f.max() == 0:
         return np.zeros_like(img2d, dtype=int)
+
     p2, p98 = np.percentile(img_f[img_f > 0], [2, 98])
     img_n   = np.clip((img_f - p2) / (p98 - p2 + 1e-9), 0, 1)
+
     if method == 'otsu':       thresh = filters.threshold_otsu(img_n)
     elif method == 'triangle': thresh = filters.threshold_triangle(img_n)
     else:                      thresh = float(method)
+
     binary = img_n > thresh
     if mask is not None: binary &= mask
     binary = morphology.remove_small_objects(binary, min_size=min_size)
     binary = morphology.remove_small_holes(binary, area_threshold=20)
-    struct_el = ndimage.generate_binary_structure(2, 2)
-    labelled, _ = ndimage.label(binary, structure=struct_el)
+
+    if use_watershed:
+        # Distance transform: 각 픽셀에서 배경까지 거리
+        dist = distance_transform_edt(binary)
+
+        # Local maxima = 각 puncta의 중심 후보
+        # min_distance: 너무 가까운 피크는 하나로 합침 (픽셀 단위)
+        coords = peak_local_max(dist, min_distance=3,
+                                labels=binary, exclude_border=False)
+        peak_mask = np.zeros_like(dist, dtype=bool)
+        peak_mask[tuple(coords.T)] = True
+
+        markers, _ = ndimage.label(peak_mask)
+        labelled = watershed(-dist, markers, mask=binary)
+    else:
+        struct_el = ndimage.generate_binary_structure(2, 2)
+        labelled, _ = ndimage.label(binary, structure=struct_el)
+
+    # 너무 큰 object 제거
     for p in measure.regionprops(labelled):
         if p.area > max_size:
             labelled[labelled == p.label] = 0
+
     return labelled
 
 
@@ -680,11 +709,20 @@ def threshold_preview(img_a, img_b, mask, ch_a_name, ch_b_name):
     ax_ov.set_title('Overlay (green/red/yellow=coloc)', color='white', fontsize=10)
 
     def get_binary(norm, thresh, min_s, max_s, m):
+        from skimage.segmentation import watershed
+        from skimage.feature import peak_local_max
+        from scipy.ndimage import distance_transform_edt
         binary = norm > thresh
         binary &= m if m.shape == norm.shape else True
         binary = morphology.remove_small_objects(binary, min_size=int(min_s))
-        struct_el = ndimage.generate_binary_structure(2, 2)
-        lab, _ = ndimage.label(binary, structure=struct_el)
+        dist = distance_transform_edt(binary)
+        coords = peak_local_max(dist, min_distance=3,
+                                labels=binary, exclude_border=False)
+        peak_mask = np.zeros_like(dist, dtype=bool)
+        if len(coords):
+            peak_mask[tuple(coords.T)] = True
+        markers, _ = ndimage.label(peak_mask)
+        lab = watershed(-dist, markers, mask=binary) if markers.max() > 0 else np.zeros_like(binary, dtype=int)
         for p in measure.regionprops(lab):
             if p.area > max_s:
                 lab[lab == p.label] = 0
@@ -927,7 +965,7 @@ if __name__ == '__main__':
     MAX_PUNCTA_PX = 500
     COLOC_DIST_PX = 3.0
 
-    OUT_DIR = r'C:\Users\user\Desktop\coloc_results'
+    OUT_DIR = r'D:\CEH\E-NS-26-01\Ctbp2_Bassoon_260402\coloc_results'
 
     valid = [f for f in IMG_FILES if os.path.exists(f)]
     if not valid:
