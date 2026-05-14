@@ -573,13 +573,25 @@ def compute_colocalization(label_a, label_b, dist_thresh_px=3.0):
         if len(hits):
             coloc_a.add(ids_a[i])
             for h in hits: coloc_b.add(ids_b[h])
+    # 면적 계산
+    area_a_total  = sum(p.area for p in props_a)
+    area_b_total  = sum(p.area for p in props_b)
+    area_a_coloc  = sum(p.area for p in props_a if p.label in coloc_a)
+    area_b_coloc  = sum(p.area for p in props_b if p.label in coloc_b)
+
     return {
         'n_a': len(props_a), 'n_b': len(props_b),
-        'n_coloc':     len(coloc_a),
-        'pct_a_coloc': round(100 * len(coloc_a) / len(props_a), 2),
-        'pct_b_coloc': round(100 * len(coloc_b) / len(props_b), 2),
-        'coloc_ids_a': sorted(coloc_a),
-        'coloc_ids_b': sorted(coloc_b),
+        'n_coloc':        len(coloc_a),
+        'pct_a_coloc':    round(100 * len(coloc_a) / len(props_a), 2),
+        'pct_b_coloc':    round(100 * len(coloc_b) / len(props_b), 2),
+        'coloc_ids_a':    sorted(coloc_a),
+        'coloc_ids_b':    sorted(coloc_b),
+        'area_a_total_px':  int(area_a_total),
+        'area_b_total_px':  int(area_b_total),
+        'area_a_coloc_px':  int(area_a_coloc),
+        'area_b_coloc_px':  int(area_b_coloc),
+        'pct_area_a_coloc': round(100 * area_a_coloc / area_a_total, 2) if area_a_total else 0.0,
+        'pct_area_b_coloc': round(100 * area_b_coloc / area_b_total, 2) if area_b_total else 0.0,
     }
 
 
@@ -955,14 +967,21 @@ def run_batch(img_files, ch_a_idx=1, ch_b_idx=2,
             'ROI_area_px':      r['roi_area_px'],
             'Ch_A':             r['ch_a'],
             'Ch_B':             r['ch_b'],
-            'n_ChA_puncta':     r['n_a'],
-            'n_ChB_puncta':     r['n_b'],
-            'n_coloc':          r['n_coloc'],
-            'pct_ChA_coloc':    r['pct_a_coloc'],
-            'pct_ChB_coloc':    r['pct_b_coloc'],
-            'threshold_method': r['threshold'],
-            'coloc_dist_px':    r['dist_px'],
-            'analyzed_at':      datetime.now().strftime('%Y-%m-%d %H:%M'),
+            'n_ChA_puncta':         r['n_a'],
+            'n_ChB_puncta':         r['n_b'],
+            'n_coloc':              r['n_coloc'],
+            'pct_ChA_coloc':        r['pct_a_coloc'],
+            'pct_ChB_coloc':        r['pct_b_coloc'],
+            'ROI_area_px':          r['roi_area_px'],
+            'area_ChA_total_px':    r['area_a_total_px'],
+            'area_ChB_total_px':    r['area_b_total_px'],
+            'area_ChA_coloc_px':    r['area_a_coloc_px'],
+            'area_ChB_coloc_px':    r['area_b_coloc_px'],
+            'pct_area_ChA_coloc':   r['pct_area_a_coloc'],
+            'pct_area_ChB_coloc':   r['pct_area_b_coloc'],
+            'threshold_method':     r['threshold'],
+            'coloc_dist_px':        r['dist_px'],
+            'analyzed_at':          datetime.now().strftime('%Y-%m-%d %H:%M'),
         } for r in all_results])
         csv_path = str(Path(out_dir) / 'colocalization_results.csv')
         df.to_csv(csv_path, index=False, encoding='utf-8-sig')
@@ -980,8 +999,8 @@ def run_batch(img_files, ch_a_idx=1, ch_b_idx=2,
 if __name__ == '__main__':
 
     IMG_FILES = [
-        r'C:\Users\user\Desktop\G1-1.czi',
-        r'C:\Users\user\Desktop\G2-1.czi',
+        r'D:\CEH\E-NS-26-01\Ctbp2_Bassoon_260402\G1-1.tiff',
+        r'D:\CEH\E-NS-26-01\Ctbp2_Bassoon_260402\G2-1.tiff',
     ]
 
     CH_A_INDEX    = 1      # 0=DAPI  1=AF488  2=AF647
