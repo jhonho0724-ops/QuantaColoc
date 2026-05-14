@@ -110,6 +110,68 @@ def _try_decode_jxr(raw_bytes):
     return None
 
 def load_czi(path):
+    # aicspylibczi 우선 사용
+    try:
+        from aicspylibczi import CziFile
+        import xml.etree.ElementTree as ET
+
+        czi = CziFile(path)
+        # read_image returns (data, dims)
+        img, shp = czi.read_image()
+        print(f"  aicspylibczi raw shape: {img.shape}, dims: {shp}")
+
+        # squeeze to (C, Y, X)
+        arr = img.squeeze()
+        # find C, Y, X axes
+        dim_names = [d[0] for d in shp]
+        if 'C' in dim_names and 'Y' in dim_names and 'X' in dim_names:
+            ci = dim_names.index('C')
+            yi = dim_names.index('Y')
+            xi = dim_names.index('X')
+            # build (C,Y,X) from squeezed
+            squeezed_dims = [d for d in dim_names if img.shape[dim_names.index(d)] > 1 
+                            or d in ('C','Y','X')]
+        
+        # simpler: just squeeze all size-1 dims except C,Y,X
+        shape = list(img.shape)
+        dims  = list(dim_names)
+        # remove size-1 dims that are not C/Y/X
+        keep = []
+        for i, (d, s) in enumerate(zip(dims, shape)):
+            if s > 1 or d in ('C', 'Y', 'X'):
+                keep.append(i)
+        arr = img
+        for ax in sorted(set(range(len(dims))) - set(keep), reverse=True):
+            arr = np.squeeze(arr, axis=ax)
+        dims = [dims[i] for i in keep]
+        shape = list(arr.shape)
+
+        print(f"  after squeeze: shape={shape}, dims={dims}")
+
+        if 'C' in dims and 'Y' in dims and 'X' in dims:
+            ci = dims.index('C')
+            yi = dims.index('Y')
+            xi = dims.index('X')
+            arr = np.transpose(arr, (ci, yi, xi))
+        elif arr.ndim == 2:
+            arr = arr[np.newaxis]
+        
+        arr = arr.astype(np.uint16)
+
+        # get channel names from metadata
+        meta_str = ET.tostring(czi.meta, encoding='unicode') if czi.meta is not None else ''
+        fluors = list(dict.fromkeys(re.findall(r'<Fluor>(.*?)</Fluor>', meta_str)))
+        if not fluors:
+            fluors = [f'Ch{i}' for i in range(arr.shape[0])]
+
+        print(f"  크기: {arr.shape[2]} x {arr.shape[1]} px,  채널: {fluors}")
+        return {'channels': fluors, 'images': arr}
+
+    except Exception as e:
+        print(f"  aicspylibczi 실패: {e}")
+        print(f"  수동 파서로 재시도...")
+
+    # fallback: manual ZISRAW parser
     xml    = _read_metadata_xml(path)
     fluors = list(dict.fromkeys(re.findall(r'<Fluor>(.*?)</Fluor>', xml)))
     sx     = int(re.search(r'<SizeX>(\d+)', xml).group(1))
@@ -182,8 +244,9 @@ def load_image(path):
 def select_roi_polygon(img_a, img_b, ch_a_name, ch_b_name, file_name, img_dapi=None):
     """
     Returns: list of polygon vertex arrays in ORIGINAL image coordinates.
-    Preview is downscaled for performance; coordinates are rescaled back.
+    Dynamic resolution: low-res overview + high-res on zoom.
     """
+    from skimage.transform import resize as sk_resize
 
     def norm8(arr):
         v = arr.astype(float)
@@ -193,35 +256,54 @@ def select_roi_polygon(img_a, img_b, ch_a_name, ch_b_name, file_name, img_dapi=N
 
     H, W = img_a.shape
 
-    # ── 미리보기 축소 (최대 2048px, 렉 방지) ─────────────────
-    MAX_PX = 2048
-    scale  = min(MAX_PX / max(W, 1), MAX_PX / max(H, 1), 1.0)
+    # ── 초기 썸네일 (최대 2048px) ────────────────────────────
+    MAX_THUMB = 2048
+    scale  = min(MAX_THUMB / max(W, 1), MAX_THUMB / max(H, 1), 1.0)
     Ph, Pw = max(1, int(H * scale)), max(1, int(W * scale))
 
-    from skimage.transform import resize as sk_resize
-    def make_thumb(arr):
+    def make_thumb(arr, th=Ph, tw=Pw):
         n = norm8(arr)
-        if scale < 1.0:
-            return (sk_resize(n.astype(float), (Ph, Pw),
+        if n.shape != (th, tw):
+            return (sk_resize(n.astype(float), (th, tw),
                               anti_aliasing=True, preserve_range=True)).astype(np.uint8)
         return n
 
-    print(f"  미리보기 생성 중... (원본 {W}x{H} -> 표시 {Pw}x{Ph}, 비율 {scale:.3f})")
+    print(f"  썸네일 생성 중... ({W}x{H} -> {Pw}x{Ph})")
     thumb_a = make_thumb(img_a)
     thumb_b = make_thumb(img_b)
+    thumb_d = make_thumb(norm8(img_dapi)) if img_dapi is not None else None
 
-    preview = np.zeros((Ph, Pw, 3), dtype=np.uint8)
-    preview[..., 1] = thumb_a
-    preview[..., 0] = thumb_b
-    # DAPI -> blue channel
-    if img_dapi is not None:
-        thumb_d = make_thumb(norm8(img_dapi))
-        preview[..., 2] = np.clip(preview[..., 2].astype(int) + thumb_d.astype(int), 0, 255).astype(np.uint8)
+    def build_composite(ta, tb, td, show_a, show_b, show_d):
+        h, w = ta.shape
+        rgb = np.zeros((h, w, 3), dtype=np.uint8)
+        if show_b: rgb[..., 0] = tb
+        if show_a: rgb[..., 1] = ta
+        if show_d and td is not None:
+            rgb[..., 2] = np.clip(rgb[..., 2].astype(int) + td.astype(int), 0, 255).astype(np.uint8)
+        return rgb
+
+    def get_hires_patch(x0, y0, x1, y1):
+        """원본 이미지에서 해당 영역만 잘라서 반환"""
+        rx0 = max(0, int(x0)); rx1 = min(W, int(x1))
+        ry0 = max(0, int(y0)); ry1 = min(H, int(y1))
+        if rx1 <= rx0 or ry1 <= ry0:
+            return None, None, None
+        pa = img_a[ry0:ry1, rx0:rx1]
+        pb = img_b[ry0:ry1, rx0:rx1]
+        pd = img_dapi[ry0:ry1, rx0:rx1] if img_dapi is not None else None
+        return norm8(pa), norm8(pb), norm8(pd) if pd is not None else None
+
+    preview = build_composite(thumb_a, thumb_b, thumb_d, True, True, True)
 
     fig, ax = plt.subplots(figsize=(13, 9))
     fig.patch.set_facecolor('#1a1a1a')
     ax.set_facecolor('#1a1a1a')
-    ax.imshow(preview, aspect='equal')
+    im_handle = ax.imshow(preview, aspect='equal', extent=[0, W, H, 0])
+    ax.set_xlim(0, W); ax.set_ylim(H, 0)
+
+    # 동적 해상도 로딩 상태
+    hires_state = [False]   # 현재 고해상도 표시 중 여부
+    MAX_HIRES_PX = 1500     # 고해상도 패치 최대 크기
     ax.set_title(
         f"{file_name}    Green={ch_a_name}   Red={ch_b_name}\n"
         "좌클릭: 꼭짓점 추가  |  더블클릭: ROI 완성  |  "
@@ -242,6 +324,30 @@ def select_roi_polygon(img_a, img_b, ch_a_name, ch_b_name, file_name, img_dapi=N
     pan_start     = [None]
 
     # ── zoom / pan ──────────────────────────────────────
+    def load_hires_if_needed():
+        """현재 뷰 영역이 충분히 확대됐으면 원본 해상도 패치 로드"""
+        xlim = ax.get_xlim(); ylim = ax.get_ylim()
+        view_w = xlim[1] - xlim[0]
+        view_h = abs(ylim[1] - ylim[0])
+        # 뷰가 전체의 20% 이하면 고해상도 로드
+        if view_w < W * 0.20 and view_h < H * 0.20:
+            ha, hb, hd = get_hires_patch(xlim[0], min(ylim), xlim[1], max(ylim))
+            if ha is not None:
+                patch = build_composite(ha, hb, hd,
+                                        ch_state[0], ch_state[1], ch_state[2])
+                im_handle.set_data(patch)
+                im_handle.set_extent([xlim[0], xlim[1], max(ylim), min(ylim)])
+                hires_state[0] = True
+        else:
+            # 축소하면 썸네일로 복귀
+            if hires_state[0]:
+                cur_composite = build_composite(thumb_a, thumb_b, thumb_d,
+                                                ch_state[0], ch_state[1], ch_state[2])
+                im_handle.set_data(cur_composite)
+                im_handle.set_extent([0, W, H, 0])
+                hires_state[0] = False
+        fig.canvas.draw_idle()
+
     def on_scroll(event):
         if event.inaxes != ax: return
         xdata, ydata = event.xdata, event.ydata
@@ -249,7 +355,7 @@ def select_roi_polygon(img_a, img_b, ch_a_name, ch_b_name, file_name, img_dapi=N
         factor = 0.85 if event.button == 'up' else 1.15
         ax.set_xlim([xdata + (x - xdata) * factor for x in xlim])
         ax.set_ylim([ydata + (y - ydata) * factor for y in ylim])
-        fig.canvas.draw_idle()
+        load_hires_if_needed()
 
     def on_press(event):
         if event.button == 3:          # 우클릭 드래그 시작
@@ -275,6 +381,7 @@ def select_roi_polygon(img_a, img_b, ch_a_name, ch_b_name, file_name, img_dapi=N
     def on_release(event):
         if event.button == 3:
             panning[0] = False
+            load_hires_if_needed()
 
     # ── drawing helpers ────────────────────────────────
     def redraw_current():
@@ -381,15 +488,18 @@ def select_roi_polygon(img_a, img_b, ch_a_name, ch_b_name, file_name, img_dapi=N
     img_disp  = [None]         # 현재 imshow 객체
 
     def update_display():
-        r = thumb_b if ch_state[1] else np.zeros((Ph, Pw), dtype=np.uint8)
-        g = thumb_a if ch_state[0] else np.zeros((Ph, Pw), dtype=np.uint8)
-        b = thumb_d if (img_dapi is not None and ch_state[2]) else np.zeros((Ph, Pw), dtype=np.uint8)
-        composite = np.stack([r, g, b], axis=-1)
-        if img_disp[0] is not None:
-            img_disp[0].set_data(composite)
+        if hires_state[0]:
+            xlim = ax.get_xlim(); ylim = ax.get_ylim()
+            ha, hb, hd = get_hires_patch(xlim[0], min(ylim), xlim[1], max(ylim))
+            if ha is not None:
+                patch = build_composite(ha, hb, hd,
+                                        ch_state[0], ch_state[1], ch_state[2])
+                im_handle.set_data(patch)
+        else:
+            composite = build_composite(thumb_a, thumb_b, thumb_d,
+                                        ch_state[0], ch_state[1], ch_state[2])
+            im_handle.set_data(composite)
         fig.canvas.draw_idle()
-
-    img_disp[0] = ax.get_images()[0]   # 기존 imshow 객체 참조
 
     def toggle_ch_a(event):
         ch_state[0] = not ch_state[0]
@@ -427,7 +537,7 @@ def select_roi_polygon(img_a, img_b, ch_a_name, ch_b_name, file_name, img_dapi=N
 
     def on_full(event):
         finished_rois.clear()
-        finished_rois.append(np.array([[0,0],[Pw,0],[Pw,Ph],[0,Ph]], dtype=float))
+        finished_rois.append(np.array([[0,0],[W,0],[W,H],[0,H]], dtype=float))
         confirmed[0] = True
         plt.close(fig)
 
@@ -469,12 +579,12 @@ def select_roi_polygon(img_a, img_b, ch_a_name, ch_b_name, file_name, img_dapi=N
 
     if not confirmed[0]:
         print("  창 닫힘. 전체 이미지로 분석합니다.")
-        return [np.array([[0,0],[W,0],[W,H],[0,H]], dtype=float)]  # original coords
+        return [np.array([[0,0],[W,0],[W,H],[0,H]], dtype=float)]
 
-    # preview 좌표 -> 원본 좌표로 변환
+    # 이미 원본 좌표계로 그려졌으므로 그대로 반환
     scaled_rois = []
     for pts in finished_rois:
-        orig_pts = pts / scale   # (x/scale, y/scale)
+        orig_pts = pts.copy()
         orig_pts[:, 0] = np.clip(orig_pts[:, 0], 0, W)
         orig_pts[:, 1] = np.clip(orig_pts[:, 1], 0, H)
         scaled_rois.append(orig_pts)
@@ -999,8 +1109,7 @@ def run_batch(img_files, ch_a_idx=1, ch_b_idx=2,
 if __name__ == '__main__':
 
     IMG_FILES = [
-        r'D:\CEH\E-NS-26-01\Ctbp2_Bassoon_260402\G1-1.tiff',
-        r'D:\CEH\E-NS-26-01\Ctbp2_Bassoon_260402\G2-1.tiff',
+        r'D:\CEH\E-NS-26-01\Ctbp2_Bassoon_260402\G2-1.czi',
     ]
 
     CH_A_INDEX    = 1      # 0=DAPI  1=AF488  2=AF647
