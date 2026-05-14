@@ -179,7 +179,7 @@ def load_image(path):
 # ─────────────────────────────────────────────
 #  Polygon ROI Selector GUI
 # ─────────────────────────────────────────────
-def select_roi_polygon(img_a, img_b, ch_a_name, ch_b_name, file_name):
+def select_roi_polygon(img_a, img_b, ch_a_name, ch_b_name, file_name, img_dapi=None):
     """
     Returns: list of polygon vertex arrays in ORIGINAL image coordinates.
     Preview is downscaled for performance; coordinates are rescaled back.
@@ -213,6 +213,10 @@ def select_roi_polygon(img_a, img_b, ch_a_name, ch_b_name, file_name):
     preview = np.zeros((Ph, Pw, 3), dtype=np.uint8)
     preview[..., 1] = thumb_a
     preview[..., 0] = thumb_b
+    # DAPI -> blue channel
+    if img_dapi is not None:
+        thumb_d = make_thumb(norm8(img_dapi))
+        preview[..., 2] = np.clip(preview[..., 2].astype(int) + thumb_d.astype(int), 0, 255).astype(np.uint8)
 
     fig, ax = plt.subplots(figsize=(13, 9))
     fig.patch.set_facecolor('#1a1a1a')
@@ -359,23 +363,27 @@ def select_roi_polygon(img_a, img_b, ch_a_name, ch_b_name, file_name):
     ax_undo = fig.add_axes([0.40, 0.01, 0.16, 0.05])
 
     # 채널 토글 버튼
-    ax_ch_a  = fig.add_axes([0.12, 0.01, 0.12, 0.05])
-    ax_ch_b  = fig.add_axes([0.25, 0.01, 0.12, 0.05])
+    ax_ch_a  = fig.add_axes([0.02, 0.01, 0.10, 0.05])
+    ax_ch_b  = fig.add_axes([0.13, 0.01, 0.10, 0.05])
+    ax_ch_d  = fig.add_axes([0.24, 0.01, 0.10, 0.05])
 
     btn_ok   = Button(ax_ok,   'Analyze', color='#27ae60', hovercolor='#2ecc71')
     btn_full = Button(ax_full, 'Full Image', color='#2980b9', hovercolor='#3498db')
     btn_undo = Button(ax_undo, 'Undo ROI',     color='#c0392b', hovercolor='#e74c3c')
-    btn_ch_a = Button(ax_ch_a, f'[ON] Ch-A', color='#1a6b1a', hovercolor='#145214')
-    btn_ch_b = Button(ax_ch_b, f'[ON] Ch-B', color='#6b1a1a', hovercolor='#521414')
+    btn_ch_a = Button(ax_ch_a, '[ON] Ch-A', color='#1a6b1a', hovercolor='#145214')
+    btn_ch_b = Button(ax_ch_b, '[ON] Ch-B', color='#6b1a1a', hovercolor='#521414')
+    btn_ch_d = Button(ax_ch_d, '[ON] DAPI', color='#1a1a6b', hovercolor='#141452')
+    if img_dapi is None:
+        ax_ch_d.set_visible(False)
 
     # 채널 표시 상태
-    ch_state  = [True, True]   # [ch_a_on, ch_b_on]
+    ch_state  = [True, True, True]   # [ch_a_on, ch_b_on, dapi_on]
     img_disp  = [None]         # 현재 imshow 객체
 
     def update_display():
         r = thumb_b if ch_state[1] else np.zeros((Ph, Pw), dtype=np.uint8)
         g = thumb_a if ch_state[0] else np.zeros((Ph, Pw), dtype=np.uint8)
-        b = np.zeros((Ph, Pw), dtype=np.uint8)
+        b = thumb_d if (img_dapi is not None and ch_state[2]) else np.zeros((Ph, Pw), dtype=np.uint8)
         composite = np.stack([r, g, b], axis=-1)
         if img_disp[0] is not None:
             img_disp[0].set_data(composite)
@@ -397,8 +405,16 @@ def select_roi_polygon(img_a, img_b, ch_a_name, ch_b_name, file_name):
         btn_ch_b.ax.set_facecolor('#6b1a1a' if ch_state[1] else '#3d3d3d')
         update_display()
 
+    def toggle_ch_d(event):
+        ch_state[2] = not ch_state[2]
+        state_str = 'ON' if ch_state[2] else 'OFF'
+        btn_ch_d.label.set_text(f'[{state_str}] DAPI')
+        btn_ch_d.ax.set_facecolor('#1a1a6b' if ch_state[2] else '#3d3d3d')
+        update_display()
+
     btn_ch_a.on_clicked(toggle_ch_a)
     btn_ch_b.on_clicked(toggle_ch_b)
+    btn_ch_d.on_clicked(toggle_ch_d)
 
     def on_confirm(event):
         if current_pts:          # 완성 안 된 ROI 자동 완성
@@ -425,8 +441,16 @@ def select_roi_polygon(img_a, img_b, ch_a_name, ch_b_name, file_name):
     btn_ok.on_clicked(on_confirm)
     btn_full.on_clicked(on_full)
     btn_undo.on_clicked(on_undo)
+    def toggle_ch_d(event):
+        ch_state[2] = not ch_state[2]
+        state_str = 'ON' if ch_state[2] else 'OFF'
+        btn_ch_d.label.set_text(f'[{state_str}] DAPI')
+        btn_ch_d.ax.set_facecolor('#1a1a6b' if ch_state[2] else '#3d3d3d')
+        update_display()
+
     btn_ch_a.on_clicked(toggle_ch_a)
     btn_ch_b.on_clicked(toggle_ch_b)
+    btn_ch_d.on_clicked(toggle_ch_d)
 
     fig.canvas.mpl_connect('scroll_event',        on_scroll)
     fig.canvas.mpl_connect('button_press_event',  on_press)
@@ -852,8 +876,11 @@ def analyze_file(img_path, ch_a_idx=1, ch_b_idx=2,
     H, W = img_a_full.shape
 
     # ROI 선택
+    # DAPI 채널 (Ch 0) 로드
+    img_dapi = imgs[0] if imgs.shape[0] > 0 else None
     roi_polygons = select_roi_polygon(img_a_full, img_b_full,
-                                      ch_a_name, ch_b_name, name)
+                                      ch_a_name, ch_b_name, name,
+                                      img_dapi=img_dapi)
     print(f"\n  ROI {len(roi_polygons)}개 선택됨")
 
     all_results = []
